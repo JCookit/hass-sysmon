@@ -30,6 +30,7 @@ ENABLE_WIFI=1
 ENABLE_UPTIME=1
 ENABLE_TEMPERATURE=1
 ENABLE_PING=1
+ENABLE_NETWORK=1
 ENABLE_TOP_CPU=0
 
 CONFIG_PING_HOST="192.168.1.1"
@@ -145,6 +146,21 @@ avg_load() {
         avg_load_10min_pc $avg_load_10min_pc
 }
 
+network_rate() {
+  RX1=$(awk "/$NETWORK_IFACE:/"'{print $2}' /proc/net/dev)
+  TX1=$(awk "/$NETWORK_IFACE:/"'{print $10}' /proc/net/dev)
+  sleep 5
+  RX2=$(awk "/$NETWORK_IFACE:/"'{print $2}' /proc/net/dev)
+  TX2=$(awk "/$NETWORK_IFACE:/"'{print $10}' /proc/net/dev)
+
+  RX_RATE=$(awk "BEGIN {printf \"%.4f\", ($RX2 - $RX1) / 5 / 1048576}")
+  TX_RATE=$(awk "BEGIN {printf \"%.4f\", ($TX2 - $TX1) / 5 / 1048576}")
+
+  print_key_vals \
+	network_up $TX_RATE \
+        network_down $RX_RATE
+}
+
 top_cpu() {
     field_ind_to_name="$(top -bn1 | grep -E  '^ +PID' | sed 's/\s\s*/\n/g' |tail -n +2| grep -nx ".*")"
 
@@ -192,12 +208,23 @@ uptime_duration() {
 disk_usage() {
     root_usage=$(df | grep " /$")
 
-    disk_free_Kb=$(echo $root_usage | awk '{print $4}')
+    disk_free_Mb=$(echo $root_usage | awk '{print $4 / 1000}')
     disk_used_pc=$(echo $root_usage | awk '{print 100 * $3 / $2}')
 
     print_key_vals \
-        disk_free_kb $disk_free_Kb \
+        disk_free_Mb $disk_free_Mb \
         disk_used_pc $disk_used_pc
+}
+
+disk_usage_usb() {
+    root_usage=$(df | grep " /mnt/usb1$")
+
+    disk_usb_free_Mb=$(echo $root_usage | awk '{print $4 / 1000}')
+    disk_usb_used_pc=$(echo $root_usage | awk '{print 100 * $3 / $2}')
+
+    print_key_vals \
+        disk_usb_free_Mb $disk_usb_free_Mb \
+        disk_usb_used_pc $disk_usb_used_pc
 }
 
 wifi_signal() {
@@ -377,12 +404,14 @@ publish_state_loop() {
         [ $ENABLE_MEMORY      -eq 1 ] && val=$(memory_usage)    && data="${data},$val"
         [ $ENABLE_SWAP        -eq 1 ] && val=$(swap_usage)      && data="${data},$val"
         [ $ENABLE_DISK        -eq 1 ] && val=$(disk_usage)      && data="${data},$val"
+        [ $ENABLE_DISK        -eq 1 ] && val=$(disk_usage_usb)  && data="${data},$val"
         [ $ENABLE_LOAD        -eq 1 ] && val=$(avg_load)        && data="${data},$val"
         [ $ENABLE_WIFI        -eq 1 ] && val=$(wifi_signal)     && data="${data},$val"
         [ $ENABLE_UPTIME      -eq 1 ] && val=$(uptime_duration) && data="${data},$val"
         [ $ENABLE_PING        -eq 1 ] && val=$(ping_host)       && data="${data},$val"
         [ $ENABLE_TEMPERATURE -eq 1 ] && val=$(temperature)     && data="${data},$val"
         [ $ENABLE_TOP_CPU     -eq 1 ] && val=$(top_cpu)         && data="${data},$val"
+        [ $ENABLE_NETWORK     -eq 1 ] && val=$(network_rate)    && data="${data},$val"
 
         json="{${data}}"
 
@@ -439,8 +468,13 @@ publish_discovery_all() {
     [ $ENABLE_WIFI   -eq 1 ] && publish_discovery_sensor wifi_link_pc "WiFi link" "%"
     [ $ENABLE_WIFI   -eq 1 ] && publish_discovery_sensor wifi_level_dbm "WiFi level" "dBm" "signal_strength"
 
-    [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_free_kb "Disk free" "kB"
+    [ $ENABLE_NETWORK -eq 1 ] && publish_discovery_sensor network_up "Network up" "MB/s" 
+    [ $ENABLE_NETWORK -eq 1 ] && publish_discovery_sensor network_down "Network down" "MB/s"
+
+    [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_free_Mb "Disk free" "MB"
     [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_used_pc "Disk used" "%"
+    [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_usb_free_Mb "Disk USB free" "MB"
+    [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_usb_used_pc "Disk USB used" "%"
 
     if [ $ENABLE_TOP_CPU -eq 1 ]; then
         i=1
