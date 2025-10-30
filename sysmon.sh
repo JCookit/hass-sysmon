@@ -32,6 +32,7 @@ ENABLE_TEMPERATURE=1
 ENABLE_PING=1
 ENABLE_NETWORK=1
 ENABLE_TOP_CPU=0
+ENABLE_DOCKER_HEALTH=1
 
 CONFIG_PING_HOST="192.168.1.1"
 
@@ -45,6 +46,24 @@ COLOR_RED="\033[31;1m"
 COLOR_GREEN="\033[32;1m"
 COLOR_BLUE="\033[33;1m"
 COLOR_GRAY="\033[37;1m"
+
+DOCKER_CONTAINERS="qbittorrentgluetun gluetun sonarr radarr bazarr prowlarr plex overseerr unpackerr flaresolverr watchtower"
+
+
+docker_health() {
+    first=1
+    for container in $DOCKER_CONTAINERS; do
+        status=$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null)
+        value="off"
+        [ "$status" = "healthy" ] && value="on"
+
+        if [ "$first" -eq 0 ]; then
+            echo -n ","
+        fi
+        print_key_vals "${container}_health" "\"$value\""
+        first=0
+    done
+}
 
 error() {
     if [ $DEBUG_LEVEL -le 3 ]; then
@@ -412,13 +431,44 @@ publish_state_loop() {
         [ $ENABLE_TEMPERATURE -eq 1 ] && val=$(temperature)     && data="${data},$val"
         [ $ENABLE_TOP_CPU     -eq 1 ] && val=$(top_cpu)         && data="${data},$val"
         [ $ENABLE_NETWORK     -eq 1 ] && val=$(network_rate)    && data="${data},$val"
+	[ $ENABLE_DOCKER_HEALTH -eq 1 ] && val=$(docker_health) && data="${data},$val"
 
         json="{${data}}"
 
         debug "publishing state message"
         post_mqtt "$STATE_TOPIC" "$json"
+
     done
 }
+
+publish_discovery_binary_sensor() {
+    param="$1"
+    name="$2"
+    device_class="$3"
+
+    config_topic="$HASS_MQTT_PREFIX/binary_sensor/$DEVICE_NAME/$param/config"
+
+    device_name="System statistics $DEVICE_NAME"
+    version="$(uname -a)"
+    device=$(print_json identifiers '["'"$DEVICE_NAME"'"]' name "\"$device_name\"" sw_version "\"$version\"")
+
+    msg=$(print_key_vals name "\"$name\"")
+    msg=$msg,$(print_key_vals state_topic \"$STATE_TOPIC\")
+    msg=$msg,$(print_key_vals json_attributes_topic \"$STATE_TOPIC\")
+    msg=$msg,$(print_key_vals expire_after \"$((5 * $MQTT_PUBLISH_PERIOD))\")
+    msg=$msg,$(print_key_vals value_template "\"{{ value_json.${param} }}\"")
+    msg=$msg,$(print_key_vals unique_id \"$DEVICE_NAME-$param\")
+    msg=$msg,$(print_key_vals device "$device")
+    msg=$msg,$(print_key_vals payload_on \"on\")
+    msg=$msg,$(print_key_vals payload_off \"off\")
+    [ $device_class ] && msg="$msg,$(print_key_vals device_class \"$device_class\")"
+
+    msg={$msg}
+
+    debug "sending discovery message for binary_sensor $param"
+    post_mqtt "$config_topic" "$msg"
+}
+
 
 publish_discovery_sensor() {
     param="$1"
@@ -446,6 +496,7 @@ publish_discovery_sensor() {
 
     debug "sending discovery message for state $param"
     post_mqtt "$config_topic" "$msg"
+
 }
 
 publish_discovery_all() {
@@ -475,6 +526,14 @@ publish_discovery_all() {
     [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_used_pc "Disk used" "%"
     [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_usb_free_Mb "Disk USB free" "MB"
     [ $ENABLE_DISK   -eq 1 ] && publish_discovery_sensor disk_usb_used_pc "Disk USB used" "%"
+
+    if [ "$ENABLE_DOCKER_HEALTH" -eq 1 ]; then
+        for container in $DOCKER_CONTAINERS; do
+            param="${container}_health"
+            name="$(printf '%s' "$container" | cut -c1 | tr '[:lower:]' '[:upper:]')$(printf '%s' "$container" | cut -c2- ) Health"
+            publish_discovery_binary_sensor "$param" "$name" "connectivity"
+        done
+    fi
 
     if [ $ENABLE_TOP_CPU -eq 1 ]; then
         i=1
