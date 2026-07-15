@@ -13,6 +13,7 @@ hass-sysmon is a ~10 KB (almost) POSIX-compliant shell script (Dash, Bash, etc.)
 * Temperature
 * WiFi RSSI/link quality
 * Ping RTT (single server for now)
+* Optional Raspberry Pi / MagicMirror diagnostics
 
 # How
 HTTP POST messages are sent to the Home Assistant MQTT service, which then publishes the messages over MQTT back to Home Assistant. If available, the `curl` command will be used otherwise it will fallback to `netcat`/`nc`, which is installed by default on OpenWrt and some Debian systems. 
@@ -68,3 +69,24 @@ exit 0
 * The busybox version of `netcat` included in OpenWrt is very barebones and doesn't support timeouts. Consequently it can't reliably confirm POST messages were successfully delivered and some may be dropped. You may need to run the script several times to make sure all the MQTT Discovery messages are sent correctly (increasing `TIMEOUT_SERVER` might help).
 * If you see any errors then try setting `DEBUG_LEVEL=0` to get more details.
 * You can also examine the HTTP POST messages by running another instance of `netcat` as a listener and change `PORT` accordingly, e.g. run `nc -l 1111` and run `sysmon.sh` with `HASS_PORT=1111`.
+
+# Raspberry Pi / MagicMirror diagnostics
+
+`sysmon.raspmm.config.example` shows a low-overhead configuration for a Raspberry Pi running MagicMirror. The Pi-specific sensors are disabled by default and can be enabled with:
+
+```
+ENABLE_PI_HEALTH=1
+ENABLE_MIRROR_HEALTH=1
+ENABLE_NETWORK_PROBES=1
+ENABLE_REBOOT_DIAGNOSTICS=1
+```
+
+The additional probes are timeout-bounded and intended for diagnostics such as WiFi/router outages, watchdog reboots, Electron memory growth, and worker-process health. Use a 60 second publish period on the Pi unless you need faster alerting.
+
+For validation without publishing to Home Assistant:
+
+```
+./sysmon.sh --once /path/to/config-dir
+```
+
+This prints one JSON payload and skips MQTT discovery/state publishing.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# sysmon.sh v0.32
+# sysmon.sh v0.33
 
 # Home Assistant configuration defaults (can be overwritten in .config file)
 HASS_TOKEN=""
@@ -33,8 +33,26 @@ ENABLE_PING=1
 ENABLE_NETWORK=1
 ENABLE_TOP_CPU=0
 ENABLE_DOCKER_HEALTH=1
+ENABLE_PI_HEALTH=0
+ENABLE_MIRROR_HEALTH=0
+ENABLE_NETWORK_PROBES=0
+ENABLE_REBOOT_DIAGNOSTICS=0
+
+METRIC_TIMEOUT_FAST=1
+METRIC_TIMEOUT_NORMAL=2
+METRIC_TIMEOUT_PROBE=6
+SLOW_METRIC_PERIOD=300
+SYSMON_PRINT_ONLY=0
 
 CONFIG_PING_HOST="192.168.1.1"
+CONFIG_DNS_HOSTS="weather.visualcrossing.com github.com outlook.live.com"
+CONFIG_HTTPS_URLS="https://weather.visualcrossing.com/ https://github.com/"
+CONFIG_TCP_TARGETS="1.1.1.1:443 8.8.8.8:443 140.82.114.3:443"
+CONFIG_GATEWAY_HOST=""
+CONFIG_MAGICMIRROR_PM2_NAME="MagicMirror"
+CONFIG_MAGICMIRROR_ELECTRON_PATTERN="/home/cookits/MagicMirror/node_modules/electron/dist/electron js/electron.js"
+CONFIG_VISION_WORKER_PATTERN="vision-worker.js"
+CONFIG_RESIZE_WORKER_PATTERN="resize-worker.js"
 
 CONFIG_TOP_CPU_IGNORE_COMMAND="top"
 CONFIG_TOP_CPU_MAX=3
@@ -93,6 +111,50 @@ debug() {
 
 cmd_exists() {
   command -v "$1" 2>&1 >/dev/null
+}
+
+run_timeout() {
+    timeout --kill-after=1 "$@"
+}
+
+json_string() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/ /g; s/\r/ /g; s/\n/ /g'
+}
+
+bool_on_off() {
+    if [ "$1" = "1" ] || [ "$1" = "true" ] || [ "$1" = "active" ] || [ "$1" = "online" ]; then
+        printf "on"
+    else
+        printf "off"
+    fi
+}
+
+append_metric() {
+    metric_value="$1"
+
+    if [ -z "$metric_value" ]; then
+        return
+    fi
+
+    if [ -z "$data" ]; then
+        data="$metric_value"
+    else
+        data="${data},$metric_value"
+    fi
+}
+
+should_run_slow_metrics() {
+    if [ "$SLOW_METRIC_PERIOD" -le 0 ]; then
+        return 0
+    fi
+
+    time_now=$(date +"%s")
+    if [ "$time_now" -ge "$time_slow_next" ]; then
+        time_slow_next=$(( time_now + SLOW_METRIC_PERIOD ))
+        return 0
+    fi
+
+    return 1
 }
 
 beginswith() {
@@ -166,14 +228,29 @@ avg_load() {
 }
 
 network_rate() {
-  RX1=$(awk "/$NETWORK_IFACE:/"'{print $2}' /proc/net/dev)
-  TX1=$(awk "/$NETWORK_IFACE:/"'{print $10}' /proc/net/dev)
-  sleep 5
+  now_sec=$(date +"%s")
   RX2=$(awk "/$NETWORK_IFACE:/"'{print $2}' /proc/net/dev)
   TX2=$(awk "/$NETWORK_IFACE:/"'{print $10}' /proc/net/dev)
 
-  RX_RATE=$(awk "BEGIN {printf \"%.4f\", ($RX2 - $RX1) / 5 / 1048576}")
-  TX_RATE=$(awk "BEGIN {printf \"%.4f\", ($TX2 - $TX1) / 5 / 1048576}")
+  if [ -z "$NETWORK_RX_LAST" ] || [ -z "$NETWORK_TX_LAST" ] || [ -z "$NETWORK_TIME_LAST" ]; then
+      NETWORK_RX_LAST="$RX2"
+      NETWORK_TX_LAST="$TX2"
+      NETWORK_TIME_LAST="$now_sec"
+      print_key_vals \
+          network_up 0 \
+          network_down 0
+      return
+  fi
+
+  elapsed=$(( now_sec - NETWORK_TIME_LAST ))
+  [ "$elapsed" -le 0 ] && elapsed=1
+
+  RX_RATE=$(awk "BEGIN {printf \"%.4f\", ($RX2 - $NETWORK_RX_LAST) / $elapsed / 1048576}")
+  TX_RATE=$(awk "BEGIN {printf \"%.4f\", ($TX2 - $NETWORK_TX_LAST) / $elapsed / 1048576}")
+
+  NETWORK_RX_LAST="$RX2"
+  NETWORK_TX_LAST="$TX2"
+  NETWORK_TIME_LAST="$now_sec"
 
   print_key_vals \
 	network_up $TX_RATE \
@@ -237,6 +314,7 @@ disk_usage() {
 
 disk_usage_usb() {
     root_usage=$(df | grep " /mnt/usb1$")
+    [ -z "$root_usage" ] && return 1
 
     disk_usb_free_Mb=$(echo $root_usage | awk '{print $4 / 1000}')
     disk_usb_used_pc=$(echo $root_usage | awk '{print 100 * $3 / $2}')
@@ -317,6 +395,207 @@ ping_host() {
 
     rtt=$(echo $result | tail -n 1 | cut -d= -f2 | cut -d\/ -f 1 | tr -d ' ')
     print_key_vals ping_rtt_ms $rtt
+}
+
+pi_health() {
+    throttled_raw="unknown"
+    throttled_num=0
+    if cmd_exists vcgencmd; then
+        throttled_raw=$(run_timeout "$METRIC_TIMEOUT_FAST" vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+        [ -z "$throttled_raw" ] && throttled_raw="unknown"
+    fi
+
+    case "$throttled_raw" in
+        0x*) throttled_num=$((throttled_raw)) ;;
+        *) throttled_num=0 ;;
+    esac
+
+    watchdog_state="unknown"
+    if cmd_exists systemctl; then
+        watchdog_state=$(run_timeout "$METRIC_TIMEOUT_FAST" systemctl is-active watchdog 2>/dev/null || true)
+        [ -z "$watchdog_state" ] && watchdog_state="unknown"
+    fi
+
+    watchdog_bootstatus=""
+    [ -r /sys/class/watchdog/watchdog0/bootstatus ] && watchdog_bootstatus=$(cat /sys/class/watchdog/watchdog0/bootstatus 2>/dev/null)
+    [ -z "$watchdog_bootstatus" ] && watchdog_bootstatus="-1"
+
+    print_key_vals \
+        pi_throttled_raw "\"$(json_string "$throttled_raw")\"" \
+        pi_under_voltage_now "\"$(bool_on_off $(( (throttled_num & 1) != 0 )) )\"" \
+        pi_freq_capped_now "\"$(bool_on_off $(( (throttled_num & 2) != 0 )) )\"" \
+        pi_throttled_now "\"$(bool_on_off $(( (throttled_num & 4) != 0 )) )\"" \
+        pi_soft_temp_limit_now "\"$(bool_on_off $(( (throttled_num & 8) != 0 )) )\"" \
+        pi_under_voltage_seen "\"$(bool_on_off $(( (throttled_num & 65536) != 0 )) )\"" \
+        pi_throttled_seen "\"$(bool_on_off $(( (throttled_num & 262144) != 0 )) )\"" \
+        watchdog_active "\"$(bool_on_off "$watchdog_state")\"" \
+        watchdog_bootstatus "$watchdog_bootstatus"
+}
+
+electron_memory() {
+    pid=$(pgrep -f "$CONFIG_MAGICMIRROR_ELECTRON_PATTERN" | head -n 1)
+    if [ -z "$pid" ] || [ ! -r "/proc/$pid/status" ]; then
+        print_key_vals \
+            electron_present "\"off\"" \
+            electron_rss_mb 0 \
+            electron_anon_mb 0
+        return
+    fi
+
+    rss_kb=$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status")
+    anon_kb=$(awk '/^RssAnon:/ {print $2}' "/proc/$pid/status")
+    rss_mb=$(( (rss_kb + 1023) / 1024 ))
+    anon_mb=$(( (anon_kb + 1023) / 1024 ))
+
+    print_key_vals \
+        electron_present "\"on\"" \
+        electron_pid "$pid" \
+        electron_rss_mb "$rss_mb" \
+        electron_anon_mb "$anon_mb"
+}
+
+mirror_health() {
+    pm2_status="unknown"
+    pm2_restarts=0
+    pm2_memory_mb=0
+
+    if cmd_exists pm2 && cmd_exists node; then
+        pm2_json=$(run_timeout "$METRIC_TIMEOUT_NORMAL" pm2 jlist 2>/dev/null || true)
+        if [ -n "$pm2_json" ]; then
+            pm2_line=$(printf '%s' "$pm2_json" | SYSMON_PM2_NAME="$CONFIG_MAGICMIRROR_PM2_NAME" node -e '
+let s = "";
+process.stdin.on("data", d => s += d).on("end", () => {
+  try {
+    const name = process.env.SYSMON_PM2_NAME;
+    const p = JSON.parse(s).find(x => x && x.name === name);
+    if (!p) return;
+    const env = p.pm2_env || {};
+    const monit = p.monit || {};
+    console.log([
+      env.status || "unknown",
+      env.restart_time || 0,
+      Math.round((monit.memory || 0) / 1048576)
+    ].join(" "));
+  } catch {}
+});' 2>/dev/null)
+            if [ -n "$pm2_line" ]; then
+                pm2_status=$(echo "$pm2_line" | awk '{print $1}')
+                pm2_restarts=$(echo "$pm2_line" | awk '{print $2}')
+                pm2_memory_mb=$(echo "$pm2_line" | awk '{print $3}')
+            fi
+        fi
+    fi
+
+    vision_present="off"
+    resize_present="off"
+    pgrep -f "$CONFIG_VISION_WORKER_PATTERN" >/dev/null 2>&1 && vision_present="on"
+    pgrep -f "$CONFIG_RESIZE_WORKER_PATTERN" >/dev/null 2>&1 && resize_present="on"
+
+    mirror_data=$(print_key_vals \
+        magicmirror_online "\"$(bool_on_off "$pm2_status")\"" \
+        magicmirror_pm2_status "\"$(json_string "$pm2_status")\"" \
+        magicmirror_pm2_restarts "$pm2_restarts" \
+        magicmirror_pm2_memory_mb "$pm2_memory_mb" \
+        vision_worker_present "\"$vision_present\"" \
+        resize_worker_present "\"$resize_present\"")
+    electron_data=$(electron_memory)
+    printf "%s,%s" "$mirror_data" "$electron_data"
+}
+
+default_gateway() {
+    if [ -n "$CONFIG_GATEWAY_HOST" ]; then
+        printf "%s" "$CONFIG_GATEWAY_HOST"
+        return
+    fi
+
+    ip route 2>/dev/null | awk '/^default / {print $3; exit}'
+}
+
+tcp_probe_summary() {
+    tmpdir=$(mktemp -d 2>/dev/null) || return 1
+
+    for target in $CONFIG_TCP_TARGETS; do
+        host=${target%:*}
+        port=${target#*:}
+        (
+            run_timeout 2 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+            printf "%s:%s " "$target" "$?"
+        ) >"$tmpdir/$host-$port" &
+    done
+
+    wait
+
+    for target in $CONFIG_TCP_TARGETS; do
+        host=${target%:*}
+        port=${target#*:}
+        cat "$tmpdir/$host-$port" 2>/dev/null
+    done
+
+    rm -rf "$tmpdir"
+}
+
+network_probes() {
+    gateway=$(default_gateway)
+    gateway_rc=1
+    dns_rc=1
+    https_rc=1
+    dns_good=""
+    https_good=""
+
+    if [ -n "$gateway" ]; then
+        run_timeout 2 ping -c 1 -W 1 "$gateway" >/dev/null 2>&1
+        gateway_rc=$?
+    fi
+
+    for host in $CONFIG_DNS_HOSTS; do
+        run_timeout 2 getent hosts "$host" >/dev/null 2>&1
+        dns_rc=$?
+        if [ "$dns_rc" -eq 0 ]; then
+            dns_good="$host"
+            break
+        fi
+    done
+
+    for url in $CONFIG_HTTPS_URLS; do
+        run_timeout "$METRIC_TIMEOUT_PROBE" curl --silent --show-error --fail --location --head --max-time 4 --connect-timeout 2 "$url" >/dev/null 2>&1
+        https_rc=$?
+        if [ "$https_rc" -eq 0 ]; then
+            https_good="$url"
+            break
+        fi
+    done
+
+    tcp_summary=$(tcp_probe_summary)
+    network_probe_ok="off"
+    [ "$gateway_rc" -eq 0 ] && [ "$dns_rc" -eq 0 ] && [ "$https_rc" -eq 0 ] && network_probe_ok="on"
+
+    print_key_vals \
+        network_probe_ok "\"$network_probe_ok\"" \
+        network_gateway_ping_ok "\"$(bool_on_off $([ "$gateway_rc" -eq 0 ] && echo 1 || echo 0))\"" \
+        network_dns_ok "\"$(bool_on_off $([ "$dns_rc" -eq 0 ] && echo 1 || echo 0))\"" \
+        network_https_ok "\"$(bool_on_off $([ "$https_rc" -eq 0 ] && echo 1 || echo 0))\"" \
+        network_gateway "\"$(json_string "$gateway")\"" \
+        network_dns_good_host "\"$(json_string "$dns_good")\"" \
+        network_https_good_url "\"$(json_string "$https_good")\"" \
+        network_tcp_summary "\"$(json_string "$tcp_summary")\""
+}
+
+reboot_diagnostics() {
+    boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+    boot_time=$(who -b 2>/dev/null | awk '{print $3" "$4}')
+    prev_last=$(run_timeout "$METRIC_TIMEOUT_NORMAL" journalctl -b -1 -n 1 --no-pager -o short-iso 2>/dev/null | cut -c1-32)
+    pstore_count=$(find /sys/fs/pstore /var/lib/systemd/pstore -maxdepth 1 -type f 2>/dev/null | wc -l | awk '{print $1}')
+    pstore_bytes=$(find /sys/fs/pstore /var/lib/systemd/pstore -maxdepth 1 -type f -printf '%s\n' 2>/dev/null | awk '{s += $1} END {print s + 0}')
+    clean_shutdown="off"
+    run_timeout "$METRIC_TIMEOUT_NORMAL" journalctl -b -1 --no-pager 2>/dev/null | tail -50 | grep -Eq 'Reached target .*Shutdown|System will reboot|systemd-shutdown' && clean_shutdown="on"
+
+    print_key_vals \
+        boot_id "\"$(json_string "$boot_id")\"" \
+        boot_time "\"$(json_string "$boot_time")\"" \
+        previous_boot_last_log "\"$(json_string "$prev_last")\"" \
+        previous_boot_clean "\"$clean_shutdown\"" \
+        pstore_record_count "$pstore_count" \
+        pstore_total_bytes "$pstore_bytes"
 }
 
 ##### Core network functions #####
@@ -406,6 +685,7 @@ publish_state_loop() {
     info "publishing state to topic $STATE_TOPIC every $MQTT_PUBLISH_PERIOD s"
 
     time_pub_next=$(date +"%s")
+    time_slow_next=0
 
     while true
     do
@@ -418,25 +698,40 @@ publish_state_loop() {
         fi
 
         time_pub_next=$(( $time_pub_next + $MQTT_PUBLISH_PERIOD))
+        run_slow=0
+        should_run_slow_metrics && run_slow=1
 
         data="$(host_name)"
-        [ $ENABLE_MEMORY      -eq 1 ] && val=$(memory_usage)    && data="${data},$val"
-        [ $ENABLE_SWAP        -eq 1 ] && val=$(swap_usage)      && data="${data},$val"
-        [ $ENABLE_DISK        -eq 1 ] && val=$(disk_usage)      && data="${data},$val"
-        [ $ENABLE_DISK        -eq 1 ] && val=$(disk_usage_usb)  && data="${data},$val"
-        [ $ENABLE_LOAD        -eq 1 ] && val=$(avg_load)        && data="${data},$val"
-        [ $ENABLE_WIFI        -eq 1 ] && val=$(wifi_signal)     && data="${data},$val"
-        [ $ENABLE_UPTIME      -eq 1 ] && val=$(uptime_duration) && data="${data},$val"
-        [ $ENABLE_PING        -eq 1 ] && val=$(ping_host)       && data="${data},$val"
-        [ $ENABLE_TEMPERATURE -eq 1 ] && val=$(temperature)     && data="${data},$val"
-        [ $ENABLE_TOP_CPU     -eq 1 ] && val=$(top_cpu)         && data="${data},$val"
-        [ $ENABLE_NETWORK     -eq 1 ] && val=$(network_rate)    && data="${data},$val"
-	[ $ENABLE_DOCKER_HEALTH -eq 1 ] && val=$(docker_health) && data="${data},$val"
+        [ $ENABLE_MEMORY      -eq 1 ] && val=$(memory_usage)       && append_metric "$val"
+        [ $ENABLE_SWAP        -eq 1 ] && val=$(swap_usage)         && append_metric "$val"
+        [ $ENABLE_DISK        -eq 1 ] && val=$(disk_usage)         && append_metric "$val"
+        [ $ENABLE_DISK        -eq 1 ] && val=$(disk_usage_usb)     && append_metric "$val"
+        [ $ENABLE_LOAD        -eq 1 ] && val=$(avg_load)           && append_metric "$val"
+        [ $ENABLE_WIFI        -eq 1 ] && val=$(wifi_signal)        && append_metric "$val"
+        [ $ENABLE_UPTIME      -eq 1 ] && val=$(uptime_duration)    && append_metric "$val"
+        [ $ENABLE_PING        -eq 1 ] && val=$(ping_host)          && append_metric "$val"
+        [ $ENABLE_TEMPERATURE -eq 1 ] && val=$(temperature)        && append_metric "$val"
+        [ $ENABLE_TOP_CPU     -eq 1 ] && val=$(top_cpu)            && append_metric "$val"
+        [ $ENABLE_NETWORK     -eq 1 ] && val=$(network_rate)       && append_metric "$val"
+	[ $ENABLE_DOCKER_HEALTH -eq 1 ] && val=$(docker_health)    && append_metric "$val"
+        [ $ENABLE_PI_HEALTH   -eq 1 ] && val=$(pi_health)          && append_metric "$val"
+        [ $ENABLE_MIRROR_HEALTH -eq 1 ] && val=$(mirror_health)    && append_metric "$val"
+        [ $ENABLE_NETWORK_PROBES -eq 1 ] && val=$(network_probes)  && append_metric "$val"
+        [ $ENABLE_REBOOT_DIAGNOSTICS -eq 1 ] && [ "$run_slow" -eq 1 ] && val=$(reboot_diagnostics) && append_metric "$val"
 
         json="{${data}}"
 
-        debug "publishing state message"
-        post_mqtt "$STATE_TOPIC" "$json"
+        if [ "$SYSMON_PRINT_ONLY" -eq 1 ]; then
+            debug "print-only mode, not publishing state message"
+        else
+            debug "publishing state message"
+            post_mqtt "$STATE_TOPIC" "$json"
+        fi
+
+        if [ "$RUN_ONCE" -eq 1 ]; then
+            printf '%s\n' "$json"
+            return
+        fi
 
     done
 }
@@ -553,6 +848,51 @@ publish_discovery_all() {
             publish_discovery_sensor $var_name "Temperature $sensor_name" "°C" "temperature"
         done
     fi
+
+    if [ $ENABLE_PI_HEALTH -eq 1 ]; then
+        publish_discovery_sensor pi_throttled_raw "Pi throttled raw" ""
+        publish_discovery_binary_sensor pi_under_voltage_now "Pi undervoltage now" "problem"
+        publish_discovery_binary_sensor pi_freq_capped_now "Pi frequency capped now" "problem"
+        publish_discovery_binary_sensor pi_throttled_now "Pi throttled now" "problem"
+        publish_discovery_binary_sensor pi_soft_temp_limit_now "Pi soft temperature limit now" "problem"
+        publish_discovery_binary_sensor pi_under_voltage_seen "Pi undervoltage seen" "problem"
+        publish_discovery_binary_sensor pi_throttled_seen "Pi throttled seen" "problem"
+        publish_discovery_binary_sensor watchdog_active "Watchdog active" "running"
+        publish_discovery_sensor watchdog_bootstatus "Watchdog bootstatus" ""
+    fi
+
+    if [ $ENABLE_MIRROR_HEALTH -eq 1 ]; then
+        publish_discovery_binary_sensor magicmirror_online "MagicMirror online" "running"
+        publish_discovery_sensor magicmirror_pm2_status "MagicMirror PM2 status" ""
+        publish_discovery_sensor magicmirror_pm2_restarts "MagicMirror PM2 restarts" ""
+        publish_discovery_sensor magicmirror_pm2_memory_mb "MagicMirror PM2 memory" "MB"
+        publish_discovery_binary_sensor electron_present "Electron present" "running"
+        publish_discovery_sensor electron_pid "Electron PID" ""
+        publish_discovery_sensor electron_rss_mb "Electron RSS" "MB"
+        publish_discovery_sensor electron_anon_mb "Electron anonymous RSS" "MB"
+        publish_discovery_binary_sensor vision_worker_present "Vision worker present" "running"
+        publish_discovery_binary_sensor resize_worker_present "Resize worker present" "running"
+    fi
+
+    if [ $ENABLE_NETWORK_PROBES -eq 1 ]; then
+        publish_discovery_binary_sensor network_probe_ok "Network probe OK" "connectivity"
+        publish_discovery_binary_sensor network_gateway_ping_ok "Gateway ping OK" "connectivity"
+        publish_discovery_binary_sensor network_dns_ok "DNS OK" "connectivity"
+        publish_discovery_binary_sensor network_https_ok "HTTPS OK" "connectivity"
+        publish_discovery_sensor network_gateway "Network gateway" ""
+        publish_discovery_sensor network_dns_good_host "DNS good host" ""
+        publish_discovery_sensor network_https_good_url "HTTPS good URL" ""
+        publish_discovery_sensor network_tcp_summary "TCP probe summary" ""
+    fi
+
+    if [ $ENABLE_REBOOT_DIAGNOSTICS -eq 1 ]; then
+        publish_discovery_sensor boot_id "Boot ID" ""
+        publish_discovery_sensor boot_time "Boot time" ""
+        publish_discovery_sensor previous_boot_last_log "Previous boot last log" ""
+        publish_discovery_binary_sensor previous_boot_clean "Previous boot clean" ""
+        publish_discovery_sensor pstore_record_count "Pstore record count" ""
+        publish_discovery_sensor pstore_total_bytes "Pstore total bytes" "B"
+    fi
 }
 
 ##### main #####
@@ -616,18 +956,30 @@ start() {
     info "using device name: $DEVICE_NAME"
 
     setup
-    publish_discovery_all
-
-    # HACK: send discovery twice to improve chances with basic netcat
-    if [ $HAS_NETCAT_BASIC -eq 1 ]; then
-        info "discovery messages may not have been delivered, resending"
+    if [ "$SYSMON_PRINT_ONLY" -eq 1 ]; then
+        info "print-only mode, skipping discovery"
+    else
         publish_discovery_all
+
+        # HACK: send discovery twice to improve chances with basic netcat
+        if [ $HAS_NETCAT_BASIC -eq 1 ]; then
+            info "discovery messages may not have been delivered, resending"
+            publish_discovery_all
+        fi
     fi
 
     publish_state_loop
 }
 
+RUN_ONCE=0
+
 # determine where to load config -- first parameter or script directory
+if [ "$1" = "--once" ]; then
+    RUN_ONCE=1
+    SYSMON_PRINT_ONLY=1
+    shift
+fi
+
 if [ ! -z "$1" ]; then
     PATH_CONFIG="$1"
 else
@@ -635,4 +987,3 @@ else
 fi
 
 start
-
